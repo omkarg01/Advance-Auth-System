@@ -84,7 +84,9 @@ export const UserScalarFieldEnum = {
     id: 'id',
     email: 'email',
     password: 'password',
-    name: 'name'
+    name: 'name',
+    provider: 'provider',
+    providerId: 'providerId'
 };
 export const SessionScalarFieldEnum = {
     id: 'id',
@@ -99,6 +101,10 @@ export const SortOrder = {
 export const QueryMode = {
     default: 'default',
     insensitive: 'insensitive'
+};
+export const NullsOrder = {
+    first: 'first',
+    last: 'last'
 };
 export const defineExtension = runtime.Extensions.defineExtension;
 //# sourceMappingURL=prismaNamespace.js.map

@@ -5,13 +5,16 @@ import { PrismaClient } from "../generated/prisma/client.js"
 import { PrismaPg } from "@prisma/adapter-pg";
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { getRefreshToken } from "../utils/index.js";
+import { generateAccessToken, getRefreshToken, hashToken } from "../utils/index.js";
 import crypto from 'crypto'
+import { OAuth2Client } from "google-auth-library";
 
 export type User = {
-    name: string,
+    name?: string | null,
     email: string,
-    id: Number
+    id: number,
+    provider?: String | null,
+    providerId?: String | null
 }
 type SignUpUser = z.infer<typeof SignupSchema>
 type SignInUser = z.infer<typeof SigninSchema>
@@ -23,6 +26,8 @@ if (typeof connectionString !== "string" || connectionString.trim() === "") {
 
 const adapter = new PrismaPg({ connectionString });
 const prisma = new PrismaClient({ adapter })
+
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID!)
 
 export const signupController = async (req: Request, res: Response) => {
     try {
@@ -36,7 +41,6 @@ export const signupController = async (req: Request, res: Response) => {
         }
 
         const hashedPassword = await bcrypt.hash(parseBody.password, 10);
-
 
 
         const createdUser = await prisma.user.create({
@@ -82,32 +86,27 @@ export const signinController = async (req: Request, res: Response) => {
             return res.status(400).json({ "message": "User does not exist!" })
         }
 
-        const result = await bcrypt.compare(parsedBody.password, existingUser.password);
+        const result = await bcrypt.compare(parsedBody.password, existingUser.password!);
 
         if (!result) {
             return res.status(400).json({ "message": "Password is incorrect!" })
         }
 
-        const key = process.env.JWT_SECRET || '';
-
-        const token = jwt.sign({  userId: existingUser.id },
-            key, { expiresIn: '30s' }
-        )
-
-        res.cookie("access_token", token)
-
         const { password, ...userWithoutPassword } = existingUser;
 
         const refreshToken = getRefreshToken();
 
-        const hash = crypto.createHash('sha256').update(refreshToken).digest('hex')
-
         await prisma.session.create({
             data: {
                 userId: existingUser.id,
-                refreshTokenHash: hash,
+                refreshTokenHash: hashToken(refreshToken),
                 expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
             }
+        })
+        res.cookie("access_token", generateAccessToken(existingUser.id.toString()), {
+            httpOnly: true,
+            secure: true,
+            sameSite: 'lax'
         })
 
         res.cookie("refresh_token", refreshToken, {
@@ -131,11 +130,10 @@ export const refreshController = async (req: Request, res: Response) => {
     try {
 
         const refresh_token = req.cookies.refresh_token;
-        const hash = crypto.createHash('sha256').update(refresh_token).digest('hex');
 
         const session = await prisma.session.findFirst({
             where: {
-                refreshTokenHash: hash,
+                refreshTokenHash: hashToken(refresh_token),
                 expiresAt: { gt: new Date() }
             }
         })
@@ -144,25 +142,107 @@ export const refreshController = async (req: Request, res: Response) => {
             return res.status(401)
         }
 
-        const key = process.env.JWT_SECRET!
-
-
-        const accessToken = jwt.sign({ userId: session.userId }, key, { expiresIn: '30s' })
-
-        res.cookie("access_token", accessToken, {
+        res.cookie("access_token", generateAccessToken(session.id.toString()), {
             httpOnly: true,
             secure: true,
-            sameSite: "lax"
+            sameSite: 'lax'
         })
 
         res.sendStatus(200)
-
-
 
     } catch (error) {
         return res.status(400).json({ error: error })
 
     }
+}
+
+export const googleAuthController = (req: Request, res: Response) => {
+    const params = new URLSearchParams({
+        client_id: process.env.GOOGLE_CLIENT_ID!,
+        redirect_uri: "http://localhost:3000/auth/google/callback",
+        response_type: "code",
+        scope: "openid email profile"
+    })
+
+    res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`)
+}
+
+export const googleAuthCBController = async (req: Request, res: Response) => {
+    const code = req.query.code;
+
+    if (!code) {
+        return res.status(401).json({ error: "Missing Code" });
+    }
+
+    const tokenResponse: any = await fetch("https://oauth2.googleapis.com/token", {
+        method: 'POST', body: JSON.stringify({
+            code,
+            client_id: process.env.GOOGLE_CLIENT_ID,
+            client_secret: process.env.GOOGLE_CLIENT_SECRET,
+            redirect_uri: "http://localhost:3000/auth/google/callback",
+            grant_type: "authorization_code"
+        })
+    }).then((data) => data.json())
+
+
+    const { id_token, access_token } = tokenResponse;
+
+
+    const ticket = await client.verifyIdToken({ idToken: id_token, audience: process.env.GOOGLE_CLIENT_ID! })
+
+    const payload = ticket.getPayload();
+
+    if (!payload) {
+        throw new Error("Invalid Google ID token");
+    }
+
+    console.log("Payload", payload);
+
+    if (!payload.email || !payload.name) {
+        throw new Error("Google token missing email/name");
+    }
+
+
+    // create user if not exist
+    let user: User | null = await prisma.user.findFirst({ where: { email: payload.email } })
+
+    if (!user) {
+        user = await prisma.user.create({
+            data: {
+                name: payload.name,
+                email: payload.email,
+                provider: "google",
+                providerId: payload.sub,
+            }
+        })
+    }
+
+    const accessToken = generateAccessToken(user.id.toString());
+    const refreshToken = getRefreshToken();
+
+
+    await prisma.session.create({
+        data: {
+            userId: user.id,
+            refreshTokenHash: hashToken(refreshToken),
+            expiresAt: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days
+        },
+    });
+
+    res.cookie("access_token", accessToken, {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'lax'
+    })
+
+    res.cookie("refresh_token", refreshToken, {
+        httpOnly: true,
+        secure: true,
+        sameSite: 'lax'
+    })
+
+
+    return res.status(201).json({ "message": "User Google LoggedIn successfully!", user })
 }
 
 export const homeController = (req: Request, res: Response) => {

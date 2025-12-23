@@ -6,12 +6,14 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { getRefreshToken } from "../utils/index.js";
 import crypto from 'crypto';
+import { OAuth2Client } from "google-auth-library";
 const connectionString = process.env.DATABASE_URL;
 if (typeof connectionString !== "string" || connectionString.trim() === "") {
     throw new Error("DATABASE_URL is not set or is not a string. Set DATABASE_URL to a valid Postgres connection string.");
 }
 const adapter = new PrismaPg({ connectionString });
 const prisma = new PrismaClient({ adapter });
+const client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 export const signupController = async (req, res) => {
     try {
         const parseBody = SignupSchema.parse(req.body);
@@ -113,9 +115,62 @@ export const refreshController = async (req, res) => {
         return res.status(400).json({ error: error });
     }
 };
+export const googleAuthController = (req, res) => {
+    const params = new URLSearchParams({
+        client_id: process.env.GOOGLE_CLIENT_ID,
+        redirect_uri: "http://localhost:3000/auth/google/callback",
+        response_type: "code",
+        scope: "openid email profile"
+    });
+    res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+};
+export const googleAuthCBController = async (req, res) => {
+    const code = req.query.code;
+    if (!code) {
+        return res.status(401).json({ error: "Missing Code" });
+    }
+    const tokenResponse = await fetch("https://oauth2.googleapis.com/token", {
+        method: 'POST', body: JSON.stringify({
+            code,
+            client_id: process.env.GOOGLE_CLIENT_ID,
+            client_secret: process.env.GOOGLE_CLIENT_SECRET,
+            redirect_uri: "http://localhost:3000/auth/google/callback",
+            grant_type: "authorization_code"
+        })
+    }).then((data) => data.json());
+    const { id_token, access_token } = tokenResponse;
+    const ticket = await client.verifyIdToken({ idToken: id_token, audience: process.env.GOOGLE_CLIENT_ID });
+    const payload = ticket.getPayload();
+    if (!payload) {
+        throw new Error("Invalid Google ID token");
+    }
+    console.log("Payload", payload);
+    if (!payload.email || !payload.name) {
+        throw new Error("Google token missing email/name");
+    }
+    // create user if not exist
+    let user = await prisma.user.findFirst({ where: { email: payload.email } });
+    if (!user) {
+        user = await prisma.user.create({
+            data: {
+                name: payload.name,
+                email: payload.email,
+                provider: "google",
+                providerId: payload.sub,
+            }
+        });
+    }
+    const key = process.env.JWT_SECRET;
+    const accessToken = jwt.sign({ userId: user.id }, key, { expiresIn: '30s' });
+    res.cookie("access_token", accessToken, {
+        httpOnly: true,
+        secure: true,
+        sameSite: "lax"
+    });
+    return res.status(201).json({ "message": "User Google LoggedIn successfully!", user });
+};
 export const homeController = (req, res) => {
     try {
-        console.log("cookie method");
         return res.status(200).json({ "message": "Welcome back! Your id is : " + req._id });
     }
     catch (error) {
